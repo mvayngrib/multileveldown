@@ -11,7 +11,9 @@ var ENCODERS = [
   messages.Put,
   messages.Delete,
   messages.Batch,
-  messages.Iterator
+  messages.Iterator,
+  messages.Subscribe,
+  messages.Unsubscribe
 ]
 
 var DECODERS = [
@@ -26,8 +28,11 @@ function Multilevel (path, opts) {
   abstract.AbstractLevelDOWN.call(this, path)
 
   if (!opts) opts = {}
+
+  this._opts = opts
   this._iterators = ids()
   this._requests = ids()
+  this._handlers = {}
   this._retry = !!opts.retry
   this._onflush = opts.onflush || noop
   this._encode = lpstream.encode()
@@ -39,11 +44,11 @@ function Multilevel (path, opts) {
 util.inherits(Multilevel, abstract.AbstractLevelDOWN)
 
 Multilevel.prototype.createRpcStream = function (opts, proxy) {
+  var self = this
   if (this._streaming) throw new Error('Only one rpc stream can be active')
   if (!opts) opts = {}
   this._ref = opts.ref || null
 
-  var self = this
   var encode = this._encode
   var decode = lpstream.decode()
 
@@ -111,9 +116,69 @@ Multilevel.prototype.createRpcStream = function (opts, proxy) {
   }
 
   function oncallback (res) {
-    var req = self._requests.remove(res.id)
-    if (req) req.callback(decodeError(res.error), decodeValue(res.value, req.valueEncoding))
+    var req = self._requests.get(res.id)
+    if (!req) return
+
+    var handler = self._handlers[res.id]
+    if (handler) {
+      if (!res.value) return // operation ack
+
+      var tag = res.value[0]
+      var enc = ENCODERS[tag]
+      var data = enc.decode(res.value.slice(1))
+      switch (tag) {
+        case 1:
+          handler(decodeValue(data.value, req.valueEncoding))
+          break
+        case 2:
+          handler(decodeValue(data.key, req.keyEncoding))
+          break
+        case 3:
+          data.ops.forEach(function (op) {
+            op.key = decodeValue(op.key, req.keyEncoding)
+            if ('value' in op) {
+              op.value = decodeValue(op.value, req.valueEncoding)
+            }
+          })
+
+          handler(data.ops)
+          break
+      }
+    } else {
+      self._requests.remove(res.id)
+      req.callback(decodeError(res.error), decodeValue(res.value, req.valueEncoding))
+    }
   }
+}
+
+Multilevel.prototype.on = function (event, handler) {
+  var req = {
+    tag: 5,
+    id: 0,
+    event: event,
+    callback: noop,
+    keyEncoding: getEncoding(this, 'keyEncoding'),
+    valueEncoding: getEncoding(this, 'valueEncoding')
+  }
+
+  req.id = this._requests.add(req)
+  handler._multilevelId = req.id
+  this._handlers[req.id] = handler
+  this._write(req)
+}
+
+Multilevel.prototype.removeListener = function (event, handler) {
+  var subscribeReqId = handler._multilevelId
+  var req = {
+    tag: 6,
+    id: 0,
+    handler: subscribeReqId,
+    callback: noop
+  }
+
+  delete this._handlers[subscribeReqId]
+  req.id = this._requests.add(req)
+  this._write(req)
 }
 
 Multilevel.prototype.forward = function (down) {
@@ -152,7 +217,7 @@ Multilevel.prototype._get = function (key, opts, cb) {
     tag: 0,
     id: 0,
     key: key,
-    valueEncoding: opts.valueEncoding || (opts.asBuffer === false ? 'utf-8' : 'binary'),
+    valueEncoding: getEncoding(this, opts, 'valueEncoding'),
     callback: cb || noop
   }
 
@@ -305,4 +370,13 @@ function ref (r) {
 
 function unref (r) {
   if (r && r.unref) r.unref()
+}
+
+function getEncoding (down, opts, which) {
+  if (typeof opts === 'string') {
+    which = opts
+    opts = {}
+  }
+
+  return opts[which] || down._opts[which] || (opts.asBuffer === false ? 'utf-8' : 'binary')
 }

@@ -134,3 +134,64 @@ tape('read stream (gt)', function (t) {
     }))
   })
 })
+
+tape('events', function (t) {
+  var db = levelup('no-location', {db: memdown, valueEncoding: 'binary'})
+  var stream = multileveldown.server(db)
+  var encOpts = {
+    keyEncoding: 'utf8',
+    valueEncoding: 'utf8'
+  }
+
+  var client1 = multileveldown.client(encOpts)
+  var client2 = multileveldown.client(encOpts)
+
+  stream.pipe(client1.createRpcStream()).pipe(stream)
+  stream.pipe(client2.createRpcStream()).pipe(stream)
+
+  // emits on op by another client
+  client1.put('hello', 'world')
+  client2.on('put', listener)
+  var called = false
+
+  function listener (value) {
+    t.equal(value, 'world')
+    client2.get('hello', function (err, value) {
+      t.equal(called, false)
+      called = true
+      t.error(err, 'no err')
+      t.same(value, 'world')
+      client2.removeListener('put', listener)
+
+      // emits on ops by same client
+      client1.del('hello', function (err) {
+        t.error(err)
+      })
+
+      client1.on('del', function (key) {
+        t.equal(key, 'hello')
+
+        var batch = [
+          { type: 'put', key: 'hello', value: 'world' },
+          { type: 'put', key: 'hello1', value: 'world1' }
+        ]
+
+        client1.batch(batch, function (err) {
+          t.error(err, 'no err')
+          t.end()
+        })
+
+        client2.on('batch', function (data) {
+          t.same(data, batch)
+          batch.forEach(function (op) {
+            op.type = 'del'
+          })
+
+          db.batch(batch, function (err) {
+            t.error(err, 'no err')
+          })
+        })
+      })
+    })
+  }
+})

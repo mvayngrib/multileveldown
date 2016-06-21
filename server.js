@@ -1,14 +1,18 @@
+var EventEmitter = require('events').EventEmitter
 var lpstream = require('length-prefixed-stream')
 var eos = require('end-of-stream')
 var duplexify = require('duplexify')
 var messages = require('./messages')
+var utils = require('./utils')
 
-var DECODERS = [
+var CODERS = [
   messages.Get,
   messages.Put,
   messages.Delete,
   messages.Batch,
-  messages.Iterator
+  messages.Iterator,
+  messages.Subscribe,
+  messages.Unsubscribe
 ]
 
 module.exports = function (db, opts) {
@@ -25,6 +29,11 @@ module.exports = function (db, opts) {
   function ready () {
     var down = db.db
     var iterators = []
+    var handlers = {
+      put: [],
+      del: [],
+      batch: []
+    }
 
     eos(stream, function () {
       while (iterators.length) {
@@ -36,9 +45,9 @@ module.exports = function (db, opts) {
     decode.on('data', function (data) {
       if (!data.length) return
       var tag = data[0]
-      if (tag >= DECODERS.length) return
+      if (tag >= CODERS.length) return
 
-      var dec = DECODERS[tag]
+      var dec = CODERS[tag]
       try {
         var req = dec.decode(data, 1)
       } catch (err) {
@@ -52,6 +61,8 @@ module.exports = function (db, opts) {
           case 2: return onreadonly(req)
           case 3: return onreadonly(req)
           case 4: return oniterator(req)
+          case 5: return onsubscribe(req)
+          case 6: return onunsubscribe(req)
         }
       } else {
         switch (tag) {
@@ -60,6 +71,8 @@ module.exports = function (db, opts) {
           case 2: return ondel(req)
           case 3: return onbatch(req)
           case 4: return oniterator(req)
+          case 5: return onsubscribe(req)
+          case 6: return onunsubscribe(req)
         }
       }
     })
@@ -72,9 +85,17 @@ module.exports = function (db, opts) {
       encode.write(buf)
     }
 
+    function emit (event, data) {
+      var eHandlers = handlers[event]
+      for (var i = 0; i < eHandlers.length; i++) {
+        eHandlers[i](data)
+      }
+    }
+
     function onput (req) {
       down.put(req.key, req.value, function (err) {
         callback(req.id, err, null)
+        if (!err) emit('put', { key: req.key, value: req.value })
       })
     }
 
@@ -87,6 +108,7 @@ module.exports = function (db, opts) {
     function ondel (req) {
       down.del(req.key, function (err) {
         callback(req.id, err)
+        if (!err) emit('del', { key: req.key })
       })
     }
 
@@ -97,6 +119,7 @@ module.exports = function (db, opts) {
     function onbatch (req) {
       down.batch(req.ops, function (err) {
         callback(req.id, err)
+        if (!err) emit('batch', { ops: req.ops })
       })
     }
 
@@ -113,6 +136,32 @@ module.exports = function (db, opts) {
         prev.batch = req.batch
         prev.next()
       }
+    }
+
+    function onsubscribe (req) {
+      var tag = utils.getEventTag(req.event)
+      var enc = CODERS[tag]
+      var handler = function (data) {
+        data.id = 0 // id doesn't matter
+        var buf = new Buffer(enc.encodingLength(data) + 1)
+        buf[0] = tag
+        enc.encode(data, buf, 1)
+        callback(req.id, null, buf)
+      }
+
+      handler._multilevelId = req.id
+      handlers[req.event].push(handler)
+    }
+
+    function onunsubscribe (req) {
+      // inefficient but in the end, pretty cheap
+      for (var event in handlers) {
+        handlers[event] = handlers[event].filter(function (handler) {
+          return handler._multilevelId !== req.handler
+        })
+      }
+
+      callback(req.id, null, null)
     }
   }
 }

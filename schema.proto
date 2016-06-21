@@ -54,3 +54,13 @@ message IteratorData {
   optional bytes key = 3;
   optional bytes value = 4;
 }
+
+message Subscribe {
+  required uint32 id = 1;
+  required string event = 2;
+}
+
+message Unsubscribe {
+  required uint32 id = 1;
+  required uint32 handler = 2;
+}
